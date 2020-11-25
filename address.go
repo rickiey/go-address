@@ -2,6 +2,7 @@ package address
 
 import (
 	"bytes"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +33,9 @@ var addressAtlasEntry = atlas.BuildEntry(Address{}).Transform().
 		})).
 	Complete()
 
+// CurrentNetwork specifies which network the address belongs to
+var CurrentNetwork = Mainnet
+
 // Address is the go type that represents an address in the filecoin network.
 type Address struct{ str string }
 
@@ -51,7 +55,7 @@ const (
 // MainnetPrefix is the main network prefix.
 const MainnetPrefix = "f"
 
-// TestnetPrefix is the main network prefix.
+// TestnetPrefix is the test network prefix.
 const TestnetPrefix = "t"
 
 // Protocol represents which protocol an address uses.
@@ -80,6 +84,9 @@ func (a Address) Protocol() Protocol {
 
 // Payload returns the payload of the address.
 func (a Address) Payload() []byte {
+	if len(a.str) == 0 {
+		return nil
+	}
 	return []byte(a.str[1:])
 }
 
@@ -90,7 +97,7 @@ func (a Address) Bytes() []byte {
 
 // String returns an address encoded as a string.
 func (a Address) String() string {
-	str, err := encode(Testnet, a)
+	str, err := encode(CurrentNetwork, a)
 	if err != nil {
 		panic(err) // I don't know if this one is okay
 	}
@@ -132,6 +139,7 @@ func (a Address) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + a.String() + `"`), nil
 }
 
+// Scan  implements the sql.Scanner interface
 func (a *Address) Scan(value interface{}) error {
 	switch value := value.(type) {
 	case string:
@@ -146,6 +154,11 @@ func (a *Address) Scan(value interface{}) error {
 	default:
 		return xerrors.New("non-string types unsupported")
 	}
+}
+
+// Value  implements the sql.Valuer interface
+func (a *Address) Value() (driver.Value, error) {
+	return a.String(), nil
 }
 
 // NewIDAddress returns an address using the ID protocol.
@@ -202,6 +215,9 @@ func addressHash(ingest []byte) []byte {
 	return hash(ingest, payloadHashConfig)
 }
 
+// FIXME: This needs to be unified with the logic of `decode` (which would
+//  handle the initial verification of the checksum separately), both are doing
+//  the exact same length checks.
 func newAddress(protocol Protocol, payload []byte) (Address, error) {
 	switch protocol {
 	case ID:
@@ -211,15 +227,15 @@ func newAddress(protocol Protocol, payload []byte) (Address, error) {
 		}
 		if n != len(payload) {
 			return Undef, xerrors.Errorf("different varint length (v:%d != p:%d): %w",
-				n, len(payload), ErrInvalidPayload)
+				n, len(payload), ErrInvalidLength)
 		}
 	case SECP256K1, Actor:
 		if len(payload) != PayloadHashLength {
-			return Undef, ErrInvalidPayload
+			return Undef, ErrInvalidLength
 		}
 	case BLS:
 		if len(payload) != BlsPublicKeyBytes {
-			return Undef, ErrInvalidPayload
+			return Undef, ErrInvalidLength
 		}
 	default:
 		return Undef, ErrUnknownProtocol
@@ -299,7 +315,7 @@ func decode(a string) (Address, error) {
 	raw := a[2:]
 	if protocol == ID {
 		// 20 is length of math.MaxUint64 as a string
-		if len(raw) > 20 {
+		if len(raw) > MaxUint64StringLength {
 			return Undef, ErrInvalidLength
 		}
 		id, err := strconv.ParseUint(raw, 10, 64)
@@ -314,16 +330,22 @@ func decode(a string) (Address, error) {
 		return Undef, err
 	}
 
-	if len(payloadcksm)-ChecksumHashLength < 0 {
-		return Undef, ErrInvalidChecksum
+	if len(payloadcksm) < ChecksumHashLength {
+		return Undef, ErrInvalidLength
 	}
 
 	payload := payloadcksm[:len(payloadcksm)-ChecksumHashLength]
 	cksm := payloadcksm[len(payloadcksm)-ChecksumHashLength:]
 
 	if protocol == SECP256K1 || protocol == Actor {
-		if len(payload) != 20 {
-			return Undef, ErrInvalidPayload
+		if len(payload) != PayloadHashLength {
+			return Undef, ErrInvalidLength
+		}
+	}
+
+	if protocol == BLS {
+		if len(payload) != BlsPublicKeyBytes {
+			return Undef, ErrInvalidLength
 		}
 	}
 
